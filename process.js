@@ -1,7 +1,7 @@
 /**
  * process.js - SS.LV scraper + Pipedrive logic
  *
- * Usage: node process.js <conversationUrl> <emailSender>
+ * Usage: node process.js <conversationUrl> <emailSender> <contactPersonName>
  */
 
 require('dotenv').config({ override: false });
@@ -10,15 +10,24 @@ const fs = require('fs');
 
 const conversationUrl = process.argv[2];
 const emailSender = (process.argv[3] || '').trim().toLowerCase();
+const contactPersonName = (process.argv[4] || 'Unknown').trim();
+const contactPersonFirstName =
+  contactPersonName.split(' ')[0] || contactPersonName;
 
 if (!conversationUrl || !emailSender) {
-  console.error('❌ Usage: node process.js <conversationUrl> <emailSender>');
+  console.error(
+    '❌ Usage: node process.js <conversationUrl> <emailSender> <contactPersonName>'
+  );
   process.exit(1);
 }
 
 // === CONFIG ===
 const PIPEDRIVE_DOMAIN = 'https://cartom.pipedrive.com';
 const API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
+if (!API_TOKEN) {
+  console.error('❌ Missing PIPEDRIVE_API_TOKEN environment variable');
+  process.exit(1);
+}
 const DEAL_OWNER_USER_ID = 24734804;
 const SOURCE_CHANNEL_FIELD_ID = 36;
 const SOURCE_COMPANY_FIELD_ID = 49;
@@ -56,8 +65,8 @@ function loadCookies() {
   return data.cookieString;
 }
 
-// === SCRAPE SS.LV ===
-async function fetchFirstMessage(cookieString, url) {
+// === SCRAPE SS.LV — ALL MESSAGES ===
+async function fetchAllMessages(cookieString, url) {
   console.log(`🌐 Fetching SS.LV conversation: ${url}`);
 
   const response = await fetch(url, {
@@ -84,6 +93,12 @@ async function fetchFirstMessage(cookieString, url) {
   const chatContent = chatDivMatch[1];
   if (chatContent.length < 50) throw new Error('Chat div is empty');
 
+  // Extract date headers
+  const dateMatches = [
+    ...chatContent.matchAll(/<div class="td15"[^>]*>\s*([^<]+)\s*<\/div>/g),
+  ];
+
+  // Extract all message texts from _out_text() calls
   const scriptRegex =
     /<script>_out_text\("([^"]*)",\s*"mail_content_(\d+)"\);<\/script>/g;
   const messageTexts = new Map();
@@ -92,16 +107,77 @@ async function fetchFirstMessage(cookieString, url) {
     messageTexts.set(scriptMatch[2], scriptMatch[1]);
   }
 
+  // Extract all message blocks
   const messageRegex =
     /<a name="(\d+)"><\/a>\s*<div[^>]*>([\s\S]*?)<td class="?td15"?[^>]*>([^<]+)<\/td>/g;
-  const match = messageRegex.exec(chatContent);
-  if (!match) throw new Error('Could not parse any messages');
 
-  const firstMessage = messageTexts.get(match[1]) || '';
-  if (!firstMessage) throw new Error('First message text is empty');
+  const messages = [];
+  let match;
+  let dateIndex = 0;
+  let currentDate = null;
 
-  console.log(`   ✓ First message: "${firstMessage.substring(0, 60)}..."`);
-  return firstMessage;
+  while ((match = messageRegex.exec(chatContent)) !== null) {
+    const messageId = match[1];
+    const messageBlock = match[2];
+    const time = match[3].trim();
+
+    // Advance date pointer
+    while (dateIndex < dateMatches.length) {
+      const datePos = chatContent.indexOf(dateMatches[dateIndex][0]);
+      if (datePos < match.index) {
+        currentDate = dateMatches[dateIndex][1].trim();
+        dateIndex++;
+      } else {
+        break;
+      }
+    }
+
+    const text = messageTexts.get(messageId) || '';
+    if (!text) {
+      console.log(`   ⚠️  No text for message ID ${messageId}, skipping`);
+      continue;
+    }
+
+    const isSent = messageBlock.includes('text-align: right;');
+
+    messages.push({
+      id: messageId,
+      text,
+      time,
+      date: currentDate || 'Unknown date',
+      direction: isSent ? 'sent' : 'received',
+    });
+  }
+
+  // Sort ascending by message ID (chronological)
+  messages.sort((a, b) => parseInt(a.id) - parseInt(b.id));
+
+  console.log(`   ✓ Found ${messages.length} message(s)`);
+  return messages;
+}
+
+// === FORMAT NOTE HTML ===
+function formatNoteHtml(message) {
+  const isSent = message.direction === 'sent';
+  const backgroundColor = isSent ? '#e8f4fd' : '#e8f8e8';
+  const borderColor = isSent ? '#2196F3' : '#4CAF50';
+  const label = isSent ? 'Message sent' : 'Message received';
+
+  return `
+<div style="
+  border-left: 4px solid ${borderColor};
+  background-color: ${backgroundColor};
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-family: Arial, sans-serif;
+">
+  <div style="font-size: 11px; color: #666; margin-bottom: 4px;">
+    <b>${label}</b> &nbsp;|&nbsp; ${message.time} &nbsp;${message.date}
+  </div>
+  <div style="font-size: 13px; color: #333;">
+    ${message.text}
+  </div>
+</div>`.trim();
 }
 
 // === PIPEDRIVE HELPERS ===
@@ -150,12 +226,9 @@ async function getDealsForPerson(personId) {
   return resp.data || [];
 }
 
-async function dealHasFirstMessageNote(dealId, firstMessage) {
+async function getNotesForDeal(dealId) {
   const resp = await pdFetch(`/notes?deal_id=${dealId}`);
-  const notes = resp.data || [];
-  return notes.some((n) =>
-    (n.content || '').includes(firstMessage.slice(0, 50))
-  );
+  return resp.data || [];
 }
 
 async function addNote(dealId, content) {
@@ -176,31 +249,28 @@ async function main() {
   const cookieString = loadCookies();
   console.log('✅ Cookies loaded\n');
 
-  // 2. Scrape first message
-  const firstMessage = await fetchFirstMessage(cookieString, conversationUrl);
+  // 2. Fetch all messages from SS.LV thread
+  const messages = await fetchAllMessages(cookieString, conversationUrl);
+  if (messages.length === 0)
+    throw new Error('No messages found in conversation');
 
-  // 3. Parse contact name from URL (not available here — comes from email)
-  //    Name is passed as optional 4th argument
-  const contactPersonName = (process.argv[4] || 'Unknown').trim();
-  const contactPersonFirstName =
-    contactPersonName.split(' ')[0] || contactPersonName;
-
-  const dealTitle = `${cfg.dealTitlePrefix} - ${contactPersonFirstName} - "${firstMessage.slice(0, 10)}..."`;
-  const noteLink = `<div><b>SS message link:</b> <a href="${conversationUrl}">${conversationUrl}</a></div>`;
-  const firstMessageNote = `${noteLink}<div><b>First SS message:</b> ${firstMessage}</div>`;
+  const firstMessage = messages[0];
+  const dealTitle = `${cfg.dealTitlePrefix} - ${contactPersonFirstName} - "${firstMessage.text.slice(0, 10)}..."`;
+  const noteLink = `<div style="font-size:11px; color:#999; margin-bottom:8px;"><b>SS thread:</b> <a href="${conversationUrl}">${conversationUrl}</a></div>`;
 
   console.log(`\n👤 Contact: ${contactPersonName}`);
   console.log(`📋 Deal title: ${dealTitle}`);
 
-  // 4. Get Pipedrive field keys
+  // 3. Get Pipedrive field keys
   const { sourceChannelKey, sourceCompanyKey } = await getDealFieldKeys();
   if (!sourceChannelKey || !sourceCompanyKey) {
     throw new Error('Could not resolve custom deal field keys');
   }
 
-  // 5. Duplicate check
+  // 4. Duplicate check
+  let dealId, personId;
+  let notesAdded = 0;
   let resultAction = '';
-  let dealId, personId, noteId;
 
   console.log('\n🔍 Checking for duplicates in Pipedrive...');
   const existingPerson = await findPersonByFirstName(contactPersonFirstName);
@@ -213,23 +283,46 @@ async function main() {
     const deals = await getDealsForPerson(personId);
     console.log(`   ✓ Found ${deals.length} deal(s) for this person`);
 
-    if (deals.length > 0) {
-      for (const deal of deals) {
-        if (await dealHasFirstMessageNote(deal.id, firstMessage)) {
-          dealId = deal.id;
-          console.log(
-            `   ✓ Found matching deal with first message note (ID: ${dealId})`
+    // Find deal that already contains the first message
+    for (const deal of deals) {
+      const existingNotes = await getNotesForDeal(deal.id);
+      const hasFirstMessage = existingNotes.some((n) =>
+        (n.content || '').includes(firstMessage.text)
+      );
+
+      if (hasFirstMessage) {
+        dealId = deal.id;
+        console.log(
+          `   ✓ Found matching deal (ID: ${dealId}) — checking for missing messages`
+        );
+
+        // Add only messages not yet in the deal notes
+        for (const message of messages) {
+          const alreadyAdded = existingNotes.some((n) =>
+            (n.content || '').includes(message.text)
           );
 
-          const latestNote = `${noteLink}<div><b>Latest SS message:</b> ${firstMessage}</div>`;
-          noteId = await addNote(dealId, latestNote);
-          resultAction = 'added_note_to_existing_deal';
-          break;
+          if (!alreadyAdded) {
+            const noteHtml = formatNoteHtml(message);
+            await addNote(dealId, noteHtml);
+            console.log(
+              `   ✓ Added missing note: "${message.text.substring(0, 40)}..."`
+            );
+            notesAdded++;
+          } else {
+            console.log(
+              `   ℹ️  Already exists: "${message.text.substring(0, 40)}..."`
+            );
+          }
         }
+
+        resultAction = 'synced_notes_to_existing_deal';
+        break;
       }
     }
   }
 
+  // 5. No matching deal found — create new person + deal + all notes
   if (!resultAction) {
     console.log('   ℹ️  No duplicate found — creating new person + deal');
 
@@ -255,15 +348,24 @@ async function main() {
     dealId = createdDeal.data.id;
     console.log(`   ✓ Created deal (ID: ${dealId})`);
 
-    noteId = await addNote(dealId, firstMessageNote);
-    console.log(`   ✓ Created note (ID: ${noteId})`);
+    // Add SS thread link as first note
+    await addNote(dealId, noteLink);
+
+    // Add all messages as separate notes in ascending order
+    for (const message of messages) {
+      const noteHtml = formatNoteHtml(message);
+      await addNote(dealId, noteHtml);
+      console.log(`   ✓ Added note: "${message.text.substring(0, 40)}..."`);
+      notesAdded++;
+    }
+
     resultAction = 'created_new_deal';
   }
 
   console.log(`\n✅ Done: ${resultAction}`);
   console.log(`   Person ID: ${personId}`);
   console.log(`   Deal ID: ${dealId}`);
-  console.log(`   Note ID: ${noteId}`);
+  console.log(`   Notes added: ${notesAdded}`);
 }
 
 main().catch((err) => {
