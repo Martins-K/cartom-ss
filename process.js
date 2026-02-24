@@ -138,7 +138,8 @@ async function fetchAllMessages(cookieString, url) {
       continue;
     }
 
-    const isSent = messageBlock.includes('text-align: right;');
+    // Detect sent vs received by background color
+    const isSent = messageBlock.includes('#d3f0f8');
 
     messages.push({
       id: messageId,
@@ -159,22 +160,16 @@ async function fetchAllMessages(cookieString, url) {
 // === FORMAT NOTE HTML ===
 function formatNoteHtml(message) {
   const isSent = message.direction === 'sent';
-  const backgroundColor = isSent ? '#e8f4fd' : '#e8f8e8';
   const borderColor = isSent ? '#2196F3' : '#4CAF50';
-  const label = isSent ? 'Message sent' : 'Message received';
+  const emoji = isSent ? '🔵' : '🟢';
+  const label = isSent ? 'Sent' : 'Received';
 
   return `
-<div style="
-  border-left: 4px solid ${borderColor};
-  background-color: ${backgroundColor};
-  padding: 8px 12px;
-  border-radius: 4px;
-  font-family: Arial, sans-serif;
-">
-  <div style="font-size: 11px; color: #666; margin-bottom: 4px;">
-    <b>${label}</b> &nbsp;|&nbsp; ${message.time} &nbsp;${message.date}
+<div style="border-left: 4px solid ${borderColor}; padding: 6px 12px; margin: 2px 0; font-family: Arial, sans-serif;">
+  <div style="font-size: 11px; color: #555; margin-bottom: 4px;">
+    ${emoji} <b>${label}</b> &nbsp;|&nbsp; <b>[${message.time} &nbsp; ${message.date}]</b>
   </div>
-  <div style="font-size: 13px; color: #333;">
+  <div style="font-size: 13px; color: #222;">
     ${message.text}
   </div>
 </div>`.trim();
