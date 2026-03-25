@@ -6,8 +6,6 @@
 
 require('dotenv').config({ override: false });
 
-const fs = require('fs');
-
 const conversationUrl = process.argv[2];
 const emailSender = (process.argv[3] || '').trim().toLowerCase();
 const contactPersonName = (process.argv[4] || 'Unknown').trim();
@@ -24,10 +22,18 @@ if (!conversationUrl || !emailSender) {
 // === CONFIG ===
 const PIPEDRIVE_DOMAIN = 'https://cartom.pipedrive.com';
 const API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
+const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
+const JSONBIN_API_KEY = process.env.JSONBIN_API_KEY;
+
 if (!API_TOKEN) {
-  console.error('❌ Missing PIPEDRIVE_API_TOKEN environment variable');
+  console.error('❌ Missing PIPEDRIVE_API_TOKEN');
   process.exit(1);
 }
+if (!JSONBIN_BIN_ID || !JSONBIN_API_KEY) {
+  console.error('❌ Missing JSONBIN_BIN_ID or JSONBIN_API_KEY');
+  process.exit(1);
+}
+
 const DEAL_OWNER_USER_ID = 24734804;
 const SOURCE_CHANNEL_FIELD_ID = 36;
 const SOURCE_COMPANY_FIELD_ID = 49;
@@ -56,13 +62,30 @@ if (!cfg) {
   process.exit(1);
 }
 
-// === LOAD COOKIES ===
-function loadCookies() {
-  if (!fs.existsSync('./ss-lv-cookies.json')) {
-    throw new Error('No cookies found. authenticate.js must run first.');
+// === JSONBIN HELPERS ===
+async function jsonbinGet() {
+  const res = await fetch(
+    `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`,
+    {
+      headers: { 'X-Master-Key': JSONBIN_API_KEY },
+    }
+  );
+  if (!res.ok) throw new Error(`JSONBin GET failed: HTTP ${res.status}`);
+  const json = await res.json();
+  return json.record;
+}
+
+// === LOAD COOKIES FROM JSONBIN ===
+async function loadCookies() {
+  console.log('🔑 Loading cookies from JSONBin...');
+  const record = await jsonbinGet();
+  if (!record?.cookieString) {
+    throw new Error(
+      'No cookieString found in JSONBin. Run authenticate.js first.'
+    );
   }
-  const data = JSON.parse(fs.readFileSync('./ss-lv-cookies.json', 'utf8'));
-  return data.cookieString;
+  console.log('   ✓ Cookies loaded');
+  return record.cookieString;
 }
 
 // === SCRAPE SS.LV — ALL MESSAGES ===
@@ -93,12 +116,10 @@ async function fetchAllMessages(cookieString, url) {
   const chatContent = chatDivMatch[1];
   if (chatContent.length < 50) throw new Error('Chat div is empty');
 
-  // Extract date headers
   const dateMatches = [
     ...chatContent.matchAll(/<div class="td15"[^>]*>\s*([^<]+)\s*<\/div>/g),
   ];
 
-  // Extract all message texts from _out_text() calls
   const scriptRegex =
     /<script>_out_text\("([^"]*)",\s*"mail_content_(\d+)"\);<\/script>/g;
   const messageTexts = new Map();
@@ -107,7 +128,6 @@ async function fetchAllMessages(cookieString, url) {
     messageTexts.set(scriptMatch[2], scriptMatch[1]);
   }
 
-  // Extract all message blocks
   const messageRegex =
     /<a name="(\d+)"><\/a>\s*<div[^>]*>([\s\S]*?)<td class="?td15"?[^>]*>([^<]+)<\/td>/g;
 
@@ -121,7 +141,6 @@ async function fetchAllMessages(cookieString, url) {
     const messageBlock = match[2];
     const time = match[3].trim();
 
-    // Advance date pointer
     while (dateIndex < dateMatches.length) {
       const datePos = chatContent.indexOf(dateMatches[dateIndex][0]);
       if (datePos < match.index) {
@@ -138,7 +157,6 @@ async function fetchAllMessages(cookieString, url) {
       continue;
     }
 
-    // Detect sent vs received by background color
     const isSent = messageBlock.includes('#d3f0f8');
 
     messages.push({
@@ -150,7 +168,6 @@ async function fetchAllMessages(cookieString, url) {
     });
   }
 
-  // Sort ascending by message ID (chronological)
   messages.sort((a, b) => parseInt(a.id) - parseInt(b.id));
 
   console.log(`   ✓ Found ${messages.length} message(s)`);
@@ -240,9 +257,8 @@ async function main() {
   console.log('║   SS.LV Process                           ║');
   console.log('╚════════════════════════════════════════════╝\n');
 
-  // 1. Load cookies
-  const cookieString = loadCookies();
-  console.log('✅ Cookies loaded\n');
+  // 1. Load cookies from JSONBin
+  const cookieString = await loadCookies();
 
   // 2. Fetch all messages from SS.LV thread
   const messages = await fetchAllMessages(cookieString, conversationUrl);
@@ -278,7 +294,6 @@ async function main() {
     const deals = await getDealsForPerson(personId);
     console.log(`   ✓ Found ${deals.length} deal(s) for this person`);
 
-    // Find deal that already contains the first message
     for (const deal of deals) {
       const existingNotes = await getNotesForDeal(deal.id);
       const hasFirstMessage = existingNotes.some((n) =>
@@ -291,7 +306,6 @@ async function main() {
           `   ✓ Found matching deal (ID: ${dealId}) — checking for missing messages`
         );
 
-        // Add only messages not yet in the deal notes
         for (const message of messages) {
           const alreadyAdded = existingNotes.some((n) =>
             (n.content || '').includes(message.text)
@@ -343,10 +357,8 @@ async function main() {
     dealId = createdDeal.data.id;
     console.log(`   ✓ Created deal (ID: ${dealId})`);
 
-    // Add SS thread link as first note
     await addNote(dealId, noteLink);
 
-    // Add all messages as separate notes in ascending order
     for (const message of messages) {
       const noteHtml = formatNoteHtml(message);
       await addNote(dealId, noteHtml);

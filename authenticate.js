@@ -1,14 +1,34 @@
 /**
  * authenticate.js - Puppeteer-based authentication
  *
- * Purpose: Only handles logging in and saving cookies
+ * Purpose: Only handles logging in and saving cookies to JSONBin
  * Run this when you need to authenticate or refresh cookies
  *
  * Usage: node authenticate.js
  */
 
 require('dotenv').config({ override: false });
-const fs = require('fs');
+
+const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
+const JSONBIN_API_KEY = process.env.JSONBIN_API_KEY;
+
+if (!JSONBIN_BIN_ID || !JSONBIN_API_KEY) {
+  console.error('❌ Missing JSONBIN_BIN_ID or JSONBIN_API_KEY in environment');
+  process.exit(1);
+}
+
+async function saveCookiesToJsonBin(cookieData) {
+  const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Master-Key': JSONBIN_API_KEY,
+    },
+    body: JSON.stringify(cookieData),
+  });
+  if (!res.ok) throw new Error(`JSONBin PUT failed: HTTP ${res.status}`);
+  return await res.json();
+}
 
 async function authenticate(phoneNumber, password, options = {}) {
   const { headless = true, verbose = true } = options;
@@ -51,7 +71,6 @@ async function authenticate(phoneNumber, password, options = {}) {
       'Accept-Language': 'en-US,en;q=0.9',
     });
 
-    // Remove webdriver detection
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', {
         get: () => false,
@@ -103,7 +122,6 @@ async function authenticate(phoneNumber, password, options = {}) {
     const currentUrl = page.url();
     log('📍 Final URL:', currentUrl);
 
-    // Check if login failed
     if (currentUrl.includes('/login/')) {
       const errorMessage = await page.evaluate(() => {
         const scripts = Array.from(document.querySelectorAll('script'));
@@ -118,7 +136,6 @@ async function authenticate(phoneNumber, password, options = {}) {
       throw new Error(errorMessage || 'Login failed - check credentials');
     }
 
-    // Verify successful login
     const pageContent = await page.content();
     const hasLogout =
       pageContent.includes('Izeja') || pageContent.includes('/lv/logout/');
@@ -130,29 +147,26 @@ async function authenticate(phoneNumber, password, options = {}) {
 
     log('✅ Login successful!');
 
-    // Get cookies
     const cookies = await page.cookies();
     const cookieString = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
 
     const cookieData = {
       timestamp: new Date().toISOString(),
       expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      cookies: cookies,
-      cookieString: cookieString,
+      cookies,
+      cookieString,
     };
-
-    fs.writeFileSync(
-      './ss-lv-cookies.json',
-      JSON.stringify(cookieData, null, 2)
-    );
-    log('💾 Cookies saved: ss-lv-cookies.json');
 
     await browser.close();
 
+    log('💾 Saving cookies to JSONBin...');
+    await saveCookiesToJsonBin(cookieData);
+    log('   ✓ Cookies saved to JSONBin');
+
     return {
       success: true,
-      cookies: cookies,
-      cookieString: cookieString,
+      cookies,
+      cookieString,
     };
   } catch (error) {
     await browser.close();
